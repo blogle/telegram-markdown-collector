@@ -15,6 +15,7 @@
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
+          revision = if self ? rev then self.rev else self.dirtyRev;
           craneLib = crane.mkLib pkgs;
           commonArgs = {
             pname = "telegram_collector";
@@ -35,6 +36,13 @@
             tag = "latest";
             contents = [ collector pkgs.cacert ];
             config = {
+              Labels = {
+                "org.opencontainers.image.source" = "https://github.com/blogle/telegram-markdown-collector";
+                "org.opencontainers.image.version" = "0.1.0";
+                "org.opencontainers.image.revision" = revision;
+                "org.opencontainers.image.title" = "Telegram Markdown Collector";
+                "org.opencontainers.image.description" = "Read-only Telegram message collector that archives raw events and renders Markdown.";
+              };
               User = "1000:1000";
               WorkingDir = "/";
               Entrypoint = [ "${collector}/bin/telegram_collector" ];
