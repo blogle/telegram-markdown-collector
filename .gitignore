@@ -1,0 +1,14 @@
+/target/
+/var/
+/output/
+*.sqlite3
+/result
+/result-*
+/.direnv/
+.env.local
+.env.local.*
+!.env.local.example
+.env
+/config.live.yaml
+*.session
+*.session-journal

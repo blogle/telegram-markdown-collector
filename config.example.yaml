@@ -1,0 +1,24 @@
+timezone: UTC
+telegram:
+  api_id_env: TELEGRAM_API_ID
+  api_hash_env: TELEGRAM_API_HASH
+  session_path: ./var/telegram.session
+  phone_env: TELEGRAM_PHONE
+  code_env: TELEGRAM_CODE
+  password_env: TELEGRAM_PASSWORD
+state:
+  database: ./var/state.sqlite3
+  archive_root: ./var/archive
+  work: ./var/work
+output:
+  root: ./output
+  attachment_root: ./var/attachments
+health:
+  listen: 0.0.0.0:8080
+streams:
+  - chat_id: 123456789
+    slug: example-chat
+    title: Example Chat
+    output_subdirectory: chats/example-chat
+    backfill:
+      from: 2024-01-01

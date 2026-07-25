@@ -1,0 +1,28 @@
+[package]
+name = "telegram_collector"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Stable Rust Telegram-to-Markdown collector"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+grammers-client = "0.10.0"
+grammers-session = { version = "0.10.0", features = ["sqlite-storage"] }
+rusqlite = "0.31"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "io-util", "net"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1

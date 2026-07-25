@@ -1,0 +1,14 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix develop --command cargo fmt --check
+      - run: nix develop --command cargo clippy --all-targets --all-features -- -D warnings
+      - run: nix develop --command cargo test --all
+      - run: nix build .#default

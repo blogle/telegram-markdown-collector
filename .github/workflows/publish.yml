@@ -1,0 +1,32 @@
+name: publish
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+permissions:
+  contents: read
+  packages: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix build .#ociImage
+      - name: Load and publish OCI image
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/telegram-markdown-collector
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker load < result
+          echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag telegram_collector:latest "$IMAGE:${GITHUB_SHA}"
+          docker push "$IMAGE:${GITHUB_SHA}"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            docker tag telegram_collector:latest "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            docker tag telegram_collector:latest "$IMAGE:${GITHUB_REF_NAME}"
+            docker push "$IMAGE:${GITHUB_REF_NAME}"
+          fi
