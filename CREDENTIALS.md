@@ -18,5 +18,6 @@ The exact first live command after the environment is present is:
 set -a; . ./.env.local; set +a; nix develop --command cargo run -- --config config.example.yaml auth
 ```
 
-Attachment bytes are intentionally reported as unsupported metadata rather than
-silently claiming a download.
+Downloadable media is written beneath
+`attachment_root/<stream-slug>/<message-id>/`; failed or unsupported downloads
+remain explicit in attachment metadata.

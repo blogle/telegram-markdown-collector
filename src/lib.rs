@@ -88,7 +88,7 @@ impl Config {
             .map_err(|_| anyhow::anyhow!("invalid IANA timezone {}", self.timezone()))?;
         let mut slugs = std::collections::HashSet::new();
         let mut ids = std::collections::HashSet::new();
-        let mut outputs = std::collections::HashSet::new();
+        let mut outputs: Vec<PathBuf> = Vec::new();
         for stream in &self.streams {
             if stream.slug.is_empty() || !slugs.insert(stream.slug.clone()) {
                 bail!("duplicate or empty stream slug {}", stream.slug);
@@ -109,9 +109,15 @@ impl Config {
                 bail!("duplicate chat_id {}", stream.chat_id);
             }
             let output = clean_relative(&stream.output_subdirectory)?;
-            if !outputs.insert(output) {
-                bail!("duplicate output_subdirectory");
+            for existing in &outputs {
+                if existing == &output
+                    || existing.starts_with(&output)
+                    || output.starts_with(existing)
+                {
+                    bail!("duplicate or overlapping output_subdirectory");
+                }
             }
+            outputs.push(output);
             if stream.backfill.from.is_none() {
                 bail!("stream {} requires backfill.from", stream.slug);
             }
@@ -358,8 +364,9 @@ impl Store {
                 return Ok(());
             }
             for entry in fs::read_dir(dir)? {
-                let path = entry?.path();
-                if path.is_dir() {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_type()?.is_dir() {
                     walk(&path)?;
                 } else if path
                     .file_name()
@@ -371,10 +378,31 @@ impl Store {
             }
             Ok(())
         }
+        fn owned_path(root: &Path, relative: &Path) -> Result<PathBuf> {
+            let root = root.canonicalize()?;
+            let candidate = root.join(clean_relative(relative)?);
+            if candidate.exists() {
+                let resolved = candidate.canonicalize()?;
+                if !resolved.starts_with(&root) {
+                    bail!("configured collector path escapes its root");
+                }
+                return Ok(resolved);
+            }
+            Ok(candidate)
+        }
         walk(&self.config.state.work)?;
-        walk(&self.config.output.root)?;
         walk(&self.config.state.archive_root)?;
-        walk(&self.config.output.attachment_root)
+        for stream in &self.config.streams {
+            walk(&owned_path(
+                &self.config.output.root,
+                &stream.output_subdirectory,
+            )?)?;
+            walk(&owned_path(
+                &self.config.output.attachment_root,
+                Path::new(&stream.slug),
+            )?)?;
+        }
+        Ok(())
     }
     pub fn ingest(
         &mut self,
@@ -1018,6 +1046,41 @@ mod tests {
         let mut c = config(d.path());
         c.streams.push(c.streams[0].clone());
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn overlapping_output_subdirectories_are_rejected() {
+        let d = tempdir().unwrap();
+        let mut c = config(d.path());
+        let mut nested = c.streams[0].clone();
+        nested.chat_id = 2;
+        nested.slug = "two".into();
+        nested.output_subdirectory = "one/nested".into();
+        c.streams.push(nested);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn cleanup_only_removes_temps_below_owned_paths() {
+        let d = tempdir().unwrap();
+        let c = config(d.path());
+        c.validate().unwrap();
+        let unmanaged = c.output.root.join("unmanaged.tmp.keep");
+        let owned_dir = c.output.root.join("one");
+        let owned_temp = owned_dir.join("render.tmp.remove");
+        let attachment_dir = c.output.attachment_root.join("one");
+        let attachment_temp = attachment_dir.join("media.tmp.remove");
+        fs::create_dir_all(&owned_dir).unwrap();
+        fs::create_dir_all(&attachment_dir).unwrap();
+        fs::write(&unmanaged, "keep").unwrap();
+        fs::write(&owned_temp, "remove").unwrap();
+        fs::write(&attachment_temp, "remove").unwrap();
+
+        Store::open(c).unwrap();
+
+        assert!(unmanaged.exists());
+        assert!(!owned_temp.exists());
+        assert!(!attachment_temp.exists());
     }
 
     #[test]
