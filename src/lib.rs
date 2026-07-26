@@ -42,6 +42,11 @@ pub struct StateConfig {
 pub struct OutputConfig {
     pub root: PathBuf,
     pub attachment_root: PathBuf,
+    #[serde(default = "default_max_markdown_bytes")]
+    pub max_markdown_bytes: usize,
+}
+fn default_max_markdown_bytes() -> usize {
+    49152
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthConfig {
@@ -86,6 +91,12 @@ impl Config {
             .timezone()
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid IANA timezone {}", self.timezone()))?;
+        if self.output.max_markdown_bytes < 4096 {
+            bail!(
+                "output.max_markdown_bytes must be at least 4096, got {}",
+                self.output.max_markdown_bytes
+            );
+        }
         let mut slugs = std::collections::HashSet::new();
         let mut ids = std::collections::HashSet::new();
         let mut outputs: Vec<PathBuf> = Vec::new();
@@ -354,7 +365,10 @@ impl Store {
             )?;
         }
         self.conn.execute_batch(
-            "INSERT OR IGNORE INTO migrations(version) VALUES(1); INSERT OR IGNORE INTO migrations(version) VALUES(2);",
+            "CREATE TABLE IF NOT EXISTS rendered_partition_files(stream_slug TEXT NOT NULL, day TEXT NOT NULL, relative_path TEXT NOT NULL, content_hash TEXT NOT NULL, PRIMARY KEY(stream_slug, day, relative_path));",
+        )?;
+        self.conn.execute_batch(
+            "INSERT OR IGNORE INTO migrations(version) VALUES(1); INSERT OR IGNORE INTO migrations(version) VALUES(2); INSERT OR IGNORE INTO migrations(version) VALUES(3);",
         )?;
         Ok(())
     }
@@ -522,7 +536,7 @@ impl Store {
                     .optional()?
                     .flatten();
                 let coverage: i64 = self.conn.query_row(
-                    "SELECT COUNT(*) FROM rendered_partitions WHERE stream_slug=?",
+                    "SELECT COUNT(DISTINCT day) FROM rendered_partition_files WHERE stream_slug=?",
                     [&stream.slug],
                     |r| r.get(0),
                 )?;
@@ -533,16 +547,13 @@ impl Store {
                 )?;
                 let mut hash_mismatches = 0;
                 let mut partitions = self.conn.prepare(
-                    "SELECT day, content_hash FROM rendered_partitions WHERE stream_slug=?",
+                    "SELECT relative_path, content_hash FROM rendered_partition_files WHERE stream_slug=?",
                 )?;
                 for row in partitions.query_map([&stream.slug], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                 })? {
-                    let (day, expected) = row?;
-                    let rel = stream
-                        .output_subdirectory
-                        .join(format!("{}/{day}.md", &day[..4]));
-                    let path = self.config.output.root.join(rel);
+                    let (relative_path, expected) = row?;
+                    let path = self.config.output.root.join(&relative_path);
                     if !path.exists() || hash_file(&path)? != expected {
                         hash_mismatches += 1;
                     }
@@ -691,12 +702,511 @@ pub fn flush_archive(store: &Store) -> Result<()> {
     }
     Ok(())
 }
+const PART_PLACEHOLDER: &str = "0009";
+
+// Conservative sizing renders parts with `parts: 1`/`Part 1 of 1` headers, but
+// the final assembled parts use `parts: N`/`Part N of N`, which are a few bytes
+// longer once a day yields ten or more parts. Partitioning against a slightly
+// reduced budget leaves headroom for that header-width drift so the final parts
+// stay within the configured read limit. The hard verification in `render`
+// guards the configured limit regardless.
+const BUDGET_MARGIN: usize = 128;
+
+type DayLookup = std::collections::HashMap<i64, (NaiveDate, usize, bool)>;
+
+#[allow(clippy::too_many_arguments)]
+fn reply_link(
+    reply: i64,
+    stream: &StreamConfig,
+    day: NaiveDate,
+    source_part: usize,
+    source_partitioned: bool,
+    target_day: &std::collections::HashMap<i64, NaiveDate>,
+    lookup: Option<&DayLookup>,
+    conservative: bool,
+) -> String {
+    let target = target_day.get(&reply).copied();
+    if conservative {
+        match target {
+            Some(td) if td == day => format!(
+                "{}.part-{}.md#^telegram-{}-{}",
+                day, PART_PLACEHOLDER, stream.chat_id, reply
+            ),
+            Some(td) => format!(
+                "../{}/{td}.part-{}.md#^telegram-{}-{}",
+                td.year(),
+                PART_PLACEHOLDER,
+                stream.chat_id,
+                reply
+            ),
+            None => format!("#^telegram-{}-{}", stream.chat_id, reply),
+        }
+    } else {
+        let lookup = match lookup {
+            Some(value) => value,
+            None => return format!("#^telegram-{}-{}", stream.chat_id, reply),
+        };
+        match target {
+            Some(td) if td == day => {
+                let (_, t_part, t_partitioned) =
+                    lookup.get(&reply).copied().unwrap_or((day, 1, false));
+                if !t_partitioned || (source_partitioned && source_part == t_part) {
+                    format!("#^telegram-{}-{}", stream.chat_id, reply)
+                } else {
+                    format!(
+                        "{}.part-{:04}.md#^telegram-{}-{}",
+                        day, t_part, stream.chat_id, reply
+                    )
+                }
+            }
+            Some(td) => {
+                let (_, t_part, t_partitioned) =
+                    lookup.get(&reply).copied().unwrap_or((td, 1, false));
+                if t_partitioned {
+                    format!(
+                        "../{}/{td}.part-{:04}.md#^telegram-{}-{}",
+                        td.year(),
+                        t_part,
+                        stream.chat_id,
+                        reply
+                    )
+                } else {
+                    format!(
+                        "../{}/{td}.md#^telegram-{}-{}",
+                        td.year(),
+                        stream.chat_id,
+                        reply
+                    )
+                }
+            }
+            None => format!("#^telegram-{}-{}", stream.chat_id, reply),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_block(
+    message: &Message,
+    stream: &StreamConfig,
+    tz: &Tz,
+    day: NaiveDate,
+    source_part: usize,
+    source_partitioned: bool,
+    target_day: &std::collections::HashMap<i64, NaiveDate>,
+    lookup: Option<&DayLookup>,
+    conservative: bool,
+    config: &Config,
+) -> Result<String> {
+    let mut body = format!("{}\n", message.anchor(&stream.slug));
+    let sender = message
+        .sender_username
+        .as_deref()
+        .or(message.sender_name.as_deref())
+        .unwrap_or("unknown");
+    body.push_str(&format!(
+        "**{}** · {}",
+        message.date.with_timezone(tz).format("%H:%M:%S %Z"),
+        markdown_escape(sender)
+    ));
+    if message.deleted {
+        body.push_str(" · [tombstone]");
+    } else if message.edit_date.is_some() {
+        body.push_str(" · [edited]");
+    }
+    body.push_str("\n\n");
+    if let Some(reply) = message.reply_to {
+        let link = reply_link(
+            reply,
+            stream,
+            day,
+            source_part,
+            source_partitioned,
+            target_day,
+            lookup,
+            conservative,
+        );
+        body.push_str(&format!("> Reply to [#{}]({link})\n>\n", reply));
+    }
+    if !message.text.is_empty() && !message.deleted {
+        body.push_str(&markdown_escape(&message.text));
+        body.push_str("\n\n");
+    }
+    for attachment in &message.attachments {
+        let safe_name = clean_filename(&attachment.name);
+        if let Some(error) = &attachment.download_error {
+            body.push_str(&format!(
+                "Attachment: {} (download failed: {})\n\n",
+                markdown_escape(&safe_name),
+                markdown_escape(error)
+            ));
+        } else {
+            let rel = attachment_link(config, stream, day, message.message_id, &safe_name)?;
+            body.push_str(&format!(
+                "Attachment: [{}]({rel})\n\n",
+                markdown_escape(&safe_name)
+            ));
+        }
+    }
+    Ok(body)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn part_content(
+    stream: &StreamConfig,
+    day: NaiveDate,
+    timezone: &str,
+    part: usize,
+    parts: usize,
+    first: i64,
+    last: i64,
+    count: usize,
+    generated_at: &DateTime<Utc>,
+    blocks: &[String],
+) -> String {
+    let body = blocks.join("");
+    format!(
+        "---\ntype: telegram-chat-part\nsource: telegram\nschema: telegram-collector/markdown/v2\nchat: {}\ntitle: {}\nstream: {}\ndate: {}\ntimezone: {}\npart: {}\nparts: {}\nfirst: {}\nlast: {}\ncount: {}\ngenerated_at: {}\n---\n\n# {} - Part {} of {}\n\n{}",
+        stream.chat_id,
+        yaml_quote(&stream.title),
+        yaml_quote(&stream.slug),
+        day,
+        timezone,
+        part,
+        parts,
+        first,
+        last,
+        count,
+        generated_at.to_rfc3339(),
+        safe_text(&stream.title),
+        part,
+        parts,
+        body
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_content(
+    stream: &StreamConfig,
+    day: NaiveDate,
+    timezone: &str,
+    first: i64,
+    last: i64,
+    count: usize,
+    parts: usize,
+    generated_at: &DateTime<Utc>,
+    part_files: &[String],
+) -> String {
+    let links = part_files
+        .iter()
+        .map(|name| format!("![[{}]]", name.trim_end_matches(".md")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "---\ntype: telegram-chat\nsource: telegram\nschema: telegram-collector/markdown/v2\nchat: {}\ntitle: {}\nstream: {}\ndate: {}\ntimezone: {}\nfirst: {}\nlast: {}\ncount: {}\nparts: {}\ngenerated_at: {}\n---\n\n# {}\n\n*This day's {} messages are split into {} retrieval-sized parts.*\n\n{links}\n",
+        stream.chat_id,
+        yaml_quote(&stream.title),
+        yaml_quote(&stream.slug),
+        day,
+        timezone,
+        first,
+        last,
+        count,
+        parts,
+        generated_at.to_rfc3339(),
+        safe_text(&stream.title),
+        count,
+        parts
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn single_content(
+    stream: &StreamConfig,
+    day: NaiveDate,
+    timezone: &str,
+    first: i64,
+    last: i64,
+    count: usize,
+    generated_at: &DateTime<Utc>,
+    blocks: &[String],
+) -> String {
+    let body = blocks.join("");
+    format!(
+        "---\ntype: telegram-chat\nsource: telegram\nschema: telegram-collector/markdown/v2\nchat: {}\ntitle: {}\nstream: {}\ndate: {}\ntimezone: {}\nfirst: {}\nlast: {}\ncount: {}\ngenerated_at: {}\n---\n\n# {}\n\n{}",
+        stream.chat_id,
+        yaml_quote(&stream.title),
+        yaml_quote(&stream.slug),
+        day,
+        timezone,
+        first,
+        last,
+        count,
+        generated_at.to_rfc3339(),
+        safe_text(&stream.title),
+        body
+    )
+}
+
+struct DayPlan {
+    parts: Vec<Vec<usize>>,
+    message_part: std::collections::HashMap<i64, usize>,
+    partitioned: bool,
+}
+
+struct RenderedDay {
+    files: Vec<(String, String)>, // (filename within the day directory, content)
+    day_hash: String,
+}
+
+/// Partition a single day using the conservative (longest) reply-link form so
+/// the final, corrected links always fit within the byte budget. The grouping
+/// returned here is authoritative; [`assemble_day`] reuses it verbatim.
+fn plan_day(
+    store: &Store,
+    stream: &StreamConfig,
+    tz: &Tz,
+    day: NaiveDate,
+    messages: &[(Message, DateTime<Utc>)],
+    target_day: &std::collections::HashMap<i64, NaiveDate>,
+    max_bytes: usize,
+) -> Result<DayPlan> {
+    let generated_at = messages
+        .iter()
+        .map(|(_, observed)| *observed)
+        .max()
+        .context("message observation missing")?;
+    let first = messages
+        .first()
+        .map(|(m, _)| m.message_id)
+        .unwrap_or_default();
+    let last = messages
+        .last()
+        .map(|(m, _)| m.message_id)
+        .unwrap_or_default();
+    // Partition against a reduced budget so the final parts — whose headers
+    // include the real parts count — still fit within `max_bytes`.
+    let size_budget = max_bytes.saturating_sub(BUDGET_MARGIN);
+
+    // Conservative blocks use the longest possible reply-link form (placeholder
+    // part number, every cross-day target treated as partitioned). This upper-
+    // bounds link bytes so corrected links produced later are never longer.
+    let mut blocks = Vec::with_capacity(messages.len());
+    for (message, _) in messages {
+        blocks.push(render_block(
+            message,
+            stream,
+            tz,
+            day,
+            1,
+            true,
+            target_day,
+            None,
+            true,
+            &store.config,
+        )?);
+    }
+
+    let timezone = store.config.timezone();
+    let day_str = day.to_string();
+
+    let mut parts: Vec<Vec<usize>> = vec![Vec::new()];
+    for (index, block) in blocks.iter().enumerate() {
+        let alone = part_content(
+            stream,
+            day,
+            timezone,
+            1,
+            1,
+            first,
+            last,
+            1,
+            &generated_at,
+            std::slice::from_ref(block),
+        );
+        if alone.len() > max_bytes {
+            bail!(
+                "message {} on {} exceeds max_markdown_bytes ({} > {}); \
+                 cannot render a single message as a retrievable part",
+                messages[index].0.message_id,
+                day_str,
+                alone.len(),
+                max_bytes
+            );
+        }
+        if !parts.last().unwrap().is_empty() {
+            let current = parts.last().unwrap().clone();
+            let joined: Vec<String> = current
+                .iter()
+                .map(|i| blocks[*i].clone())
+                .chain(std::iter::once(block.clone()))
+                .collect();
+            let piece = part_content(
+                stream,
+                day,
+                timezone,
+                1,
+                1,
+                first,
+                last,
+                joined.len(),
+                &generated_at,
+                &joined,
+            );
+            if piece.len() > size_budget {
+                parts.push(Vec::new());
+            }
+        }
+        parts.last_mut().unwrap().push(index);
+    }
+
+    let partitioned = parts.len() > 1;
+    let mut message_part: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for (part_index, group) in parts.iter().enumerate() {
+        for i in group {
+            message_part.insert(messages[*i].0.message_id, part_index + 1);
+        }
+    }
+
+    Ok(DayPlan {
+        parts,
+        message_part,
+        partitioned,
+    })
+}
+
+/// Render the final day files using the corrected reply links while reusing the
+/// authoritative partition grouping from [`plan_day`]. Corrected links are never
+/// longer than the conservative form, so every part still fits the budget.
+#[allow(clippy::too_many_arguments)]
+fn assemble_day(
+    store: &Store,
+    stream: &StreamConfig,
+    tz: &Tz,
+    day: NaiveDate,
+    messages: &[(Message, DateTime<Utc>)],
+    target_day: &std::collections::HashMap<i64, NaiveDate>,
+    plan: &DayPlan,
+    lookup: &DayLookup,
+) -> Result<RenderedDay> {
+    let generated_at = messages
+        .iter()
+        .map(|(_, observed)| *observed)
+        .max()
+        .context("message observation missing")?;
+    let first = messages
+        .first()
+        .map(|(m, _)| m.message_id)
+        .unwrap_or_default();
+    let last = messages
+        .last()
+        .map(|(m, _)| m.message_id)
+        .unwrap_or_default();
+    let timezone = store.config.timezone();
+    let day_str = day.to_string();
+    let parts_total = plan.parts.len();
+
+    let mut files: Vec<(String, String)> = Vec::new();
+    if plan.partitioned {
+        let mut part_files: Vec<String> = Vec::new();
+        for (part_index, group) in plan.parts.iter().enumerate() {
+            let part_number = part_index + 1;
+            let joined: Vec<String> = group
+                .iter()
+                .map(|i| {
+                    render_block(
+                        &messages[*i].0,
+                        stream,
+                        tz,
+                        day,
+                        part_number,
+                        true,
+                        target_day,
+                        Some(lookup),
+                        false,
+                        &store.config,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let part_first = messages[*group.first().unwrap()].0.message_id;
+            let part_last = messages[*group.last().unwrap()].0.message_id;
+            let content = part_content(
+                stream,
+                day,
+                timezone,
+                part_number,
+                parts_total,
+                part_first,
+                part_last,
+                group.len(),
+                &generated_at,
+                &joined,
+            );
+            let filename = format!("{day_str}.part-{:04}.md", part_number);
+            part_files.push(filename.clone());
+            files.push((filename, content));
+        }
+        let index = index_content(
+            stream,
+            day,
+            timezone,
+            first,
+            last,
+            messages.len(),
+            parts_total,
+            &generated_at,
+            &part_files,
+        );
+        files.insert(0, (format!("{day_str}.md"), index));
+    } else {
+        let joined: Vec<String> = plan.parts[0]
+            .iter()
+            .map(|i| {
+                render_block(
+                    &messages[*i].0,
+                    stream,
+                    tz,
+                    day,
+                    1,
+                    false,
+                    target_day,
+                    Some(lookup),
+                    false,
+                    &store.config,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let content = single_content(
+            stream,
+            day,
+            timezone,
+            first,
+            last,
+            messages.len(),
+            &generated_at,
+            &joined,
+        );
+        files.push((format!("{day_str}.md"), content));
+    }
+
+    let day_hash = hash_bytes(
+        files
+            .iter()
+            .map(|(name, content)| hash_bytes(format!("{name}\0{content}").as_bytes()))
+            .collect::<Vec<_>>()
+            .join("\0")
+            .as_bytes(),
+    );
+
+    Ok(RenderedDay { files, day_hash })
+}
+
 pub fn render(store: &Store) -> Result<usize> {
     let tz: Tz = store
         .config
         .timezone()
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid timezone"))?;
+    let max_bytes = store.config.output.max_markdown_bytes;
     let mut count = 0;
     for stream in &store.config.streams {
         let mut by_day =
@@ -707,108 +1217,154 @@ pub fn render(store: &Store) -> Result<usize> {
                 .or_default()
                 .push((message, observed));
         }
-        for (day, mut messages) in by_day {
+
+        // Precompute the original-day of every reply target so links resolve
+        // without a per-message query and so the partitioner can size links.
+        let mut target_day: std::collections::HashMap<i64, NaiveDate> =
+            std::collections::HashMap::new();
+        let mut stmt = store
+            .conn
+            .prepare("SELECT message_id, original_date FROM events WHERE stream_slug=?")?;
+        let rows = stmt
+            .query_map([&stream.slug], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for (id, date) in rows {
+            target_day.insert(id, date.parse()?);
+        }
+
+        // Phase A: conservative partitioning using the longest possible reply
+        // link form (assumes every target is partitioned in a different part).
+        // This upper-bounds link bytes so the final, corrected links always fit.
+        let mut plans = std::collections::BTreeMap::new();
+        for (day, messages) in &by_day {
+            let mut messages = messages.clone();
             messages.sort_by_key(|(message, _)| message.message_id);
-            let generated_at = messages
+            plans.insert(
+                *day,
+                plan_day(store, stream, &tz, *day, &messages, &target_day, max_bytes)?,
+            );
+        }
+
+        // Phase B: build the global message -> (day, part, partitioned) lookup
+        // from the conservative partition, then assemble final files with the
+        // corrected (never longer) reply links, reusing the same grouping.
+        let lookup: DayLookup = plans
+            .iter()
+            .flat_map(|(day, plan)| {
+                plan.message_part
+                    .iter()
+                    .map(|(id, part)| (*id, (*day, *part, plan.partitioned)))
+            })
+            .collect();
+        let mut final_plans = std::collections::BTreeMap::new();
+        for (day, messages) in &by_day {
+            let mut messages = messages.clone();
+            messages.sort_by_key(|(message, _)| message.message_id);
+            final_plans.insert(
+                *day,
+                assemble_day(
+                    store,
+                    stream,
+                    &tz,
+                    *day,
+                    &messages,
+                    &target_day,
+                    &plans[day],
+                    &lookup,
+                )?,
+            );
+        }
+
+        // Phase C: write files, clean stale parts, and persist per-file hashes.
+        for (day, plan) in &final_plans {
+            let day_str = day.to_string();
+            // Hard verification: every emitted part must stay within the read
+            // limit, regardless of header-width drift or future link forms.
+            for (name, content) in &plan.files {
+                if name.starts_with(&format!("{day_str}.part-")) && content.len() > max_bytes {
+                    bail!(
+                        "rendered partition {} on {} exceeds max_markdown_bytes \
+                         ({} > {}); refusing to emit an unreadable part",
+                        name,
+                        day_str,
+                        content.len(),
+                        max_bytes
+                    );
+                }
+            }
+            let day_rel_base = stream.output_subdirectory.join(format!("{}", day.year()));
+            let old_files: Vec<String> = store
+                .conn
+                .prepare(
+                    "SELECT relative_path FROM rendered_partition_files WHERE stream_slug=? AND day=?",
+                )?
+                .query_map(params![stream.slug, day_str], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            let new_files: std::collections::HashSet<String> = plan
+                .files
                 .iter()
-                .map(|(_, observed)| *observed)
-                .max()
-                .context("message observation missing")?;
-            let first = messages
-                .first()
-                .map(|(m, _)| m.message_id)
-                .unwrap_or_default();
-            let last = messages
-                .last()
-                .map(|(m, _)| m.message_id)
-                .unwrap_or_default();
-            let mut body = format!("---\ntype: telegram-chat\nsource: telegram\nschema: telegram-collector/markdown/v1\nchat: {}\ntitle: {}\nstream: {}\ndate: {}\ntimezone: {}\nfirst: {}\nlast: {}\ncount: {}\ngenerated_at: {}\n---\n\n# {}\n\n", stream.chat_id, yaml_quote(&stream.title), yaml_quote(&stream.slug), day, store.config.timezone(), first, last, messages.len(), generated_at.to_rfc3339(), safe_text(&stream.title));
-            for (message, _) in messages {
-                body.push_str(&format!("{}\n", message.anchor(&stream.slug)));
-                let sender = message
-                    .sender_username
-                    .as_deref()
-                    .or(message.sender_name.as_deref())
-                    .unwrap_or("unknown");
-                body.push_str(&format!(
-                    "**{}** · {}",
-                    message.date.with_timezone(&tz).format("%H:%M:%S %Z"),
-                    markdown_escape(sender)
-                ));
-                if message.deleted {
-                    body.push_str(" · [tombstone]");
-                } else if message.edit_date.is_some() {
-                    body.push_str(" · [edited]");
+                .map(|(name, _)| day_rel_base.join(name).to_string_lossy().into_owned())
+                .collect();
+
+            let mut changed = false;
+            for (name, content) in &plan.files {
+                let rel = day_rel_base.join(name);
+                let path = store.config.path(&store.config.output.root, &rel)?;
+                let hash = hash_bytes(content.as_bytes());
+                if path.exists() && hash_file(&path)? == hash {
+                    continue;
                 }
-                body.push_str("\n\n");
-                if let Some(reply) = message.reply_to {
-                    let target_day = store
-                        .conn
-                        .query_row(
-                            "SELECT original_date FROM events WHERE event_key=?",
-                            params![format!("{}:{}", stream.slug, reply)],
-                            |r| r.get::<_, String>(0),
-                        )
-                        .optional()?;
-                    let link = match target_day {
-                        Some(target) if target == day.to_string() => {
-                            format!("#^telegram-{}-{}", stream.chat_id, reply)
-                        }
-                        Some(target) => format!(
-                            "../{}/{}.md#^telegram-{}-{}",
-                            &target[..4],
-                            target,
-                            stream.chat_id,
-                            reply
-                        ),
-                        None => format!("#^telegram-{}-{}", stream.chat_id, reply),
-                    };
-                    body.push_str(&format!("> Reply to [#{}]({link})\n>\n", reply));
+                atomic_replace(&path, content.as_bytes())?;
+                changed = true;
+            }
+
+            // Remove collector-owned stale parts that this run no longer emits.
+            for old in &old_files {
+                if new_files.contains(old) {
+                    continue;
                 }
-                if !message.text.is_empty() && !message.deleted {
-                    body.push_str(&markdown_escape(&message.text));
-                    body.push_str("\n\n");
-                }
-                for attachment in message.attachments {
-                    let safe_name = clean_filename(&attachment.name);
-                    if let Some(error) = attachment.download_error {
-                        body.push_str(&format!(
-                            "Attachment: {} (download failed: {})\n\n",
-                            markdown_escape(&safe_name),
-                            markdown_escape(&error)
-                        ));
-                    } else {
-                        let rel = attachment_link(
-                            &store.config,
-                            stream,
-                            day,
-                            message.message_id,
-                            &safe_name,
-                        )?;
-                        body.push_str(&format!(
-                            "Attachment: [{}]({rel})\n\n",
-                            markdown_escape(&safe_name)
-                        ));
+                let path = store
+                    .config
+                    .path(&store.config.output.root, Path::new(old))?;
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with(&format!("{day_str}.part-")) && name.ends_with(".md") {
+                        let _ = fs::remove_file(&path);
+                        changed = true;
                     }
                 }
             }
-            let rel = stream
-                .output_subdirectory
-                .join(format!("{}/{day}.md", day.year()));
-            let path = store.config.path(&store.config.output.root, &rel)?;
-            let hash = hash_bytes(body.as_bytes());
-            let old: Option<String> = store
+
+            let day_matches = store
                 .conn
                 .query_row(
                     "SELECT content_hash FROM rendered_partitions WHERE stream_slug=? AND day=?",
-                    params![stream.slug, day.to_string()],
-                    |r| r.get(0),
+                    params![stream.slug, day_str],
+                    |r| r.get::<_, String>(0),
                 )
-                .optional()?;
-            let output_matches = path.exists() && hash_file(&path)? == hash;
-            if old.as_deref() != Some(hash.as_str()) || !output_matches {
-                atomic_replace(&path, body.as_bytes())?;
-                store.conn.execute("INSERT INTO rendered_partitions(stream_slug,day,content_hash) VALUES(?,?,?) ON CONFLICT(stream_slug,day) DO UPDATE SET content_hash=excluded.content_hash", params![stream.slug, day.to_string(), hash])?;
+                .optional()?
+                == Some(plan.day_hash.clone());
+            if changed || !day_matches {
+                store.conn.execute(
+                    "INSERT INTO rendered_partitions(stream_slug,day,content_hash) VALUES(?,?,?) \
+                     ON CONFLICT(stream_slug,day) DO UPDATE SET content_hash=excluded.content_hash",
+                    params![stream.slug, day_str, plan.day_hash],
+                )?;
+                store.conn.execute(
+                    "DELETE FROM rendered_partition_files WHERE stream_slug=? AND day=?",
+                    params![stream.slug, day_str],
+                )?;
+                for (name, content) in &plan.files {
+                    let rel = day_rel_base.join(name);
+                    let hash = hash_bytes(content.as_bytes());
+                    store.conn.execute(
+                        "INSERT INTO rendered_partition_files(stream_slug,day,relative_path,content_hash) VALUES(?,?,?,?)",
+                        params![stream.slug, day_str, rel.to_string_lossy(), hash],
+                    )?;
+                }
                 count += 1;
             }
         }
@@ -882,7 +1438,14 @@ pub fn attachment_link(
 }
 
 fn relative_path(from: &Path, to: &Path) -> Result<String> {
-    let from = from.canonicalize()?;
+    let from = if from.exists() {
+        from.canonicalize()?
+    } else {
+        from.parent()
+            .context("source has no parent")?
+            .canonicalize()?
+            .join(from.file_name().context("source has no filename")?)
+    };
     let to = if to.exists() {
         to.canonicalize()?
     } else {
@@ -963,6 +1526,7 @@ mod tests {
             output: OutputConfig {
                 root: dir.join("out"),
                 attachment_root: dir.join("att"),
+                max_markdown_bytes: 49152,
             },
             health: HealthConfig {
                 listen: "0.0.0.0:8080".into(),
@@ -1425,5 +1989,286 @@ mod tests {
         assert!(status.latest_date.is_some());
         assert!(status.missing_ranges.is_empty());
         assert!(status.failure.is_none());
+    }
+
+    fn large_text(n: usize) -> String {
+        "α".repeat(n)
+    }
+
+    #[test]
+    fn oversized_day_partitions_on_message_boundaries_under_byte_limit() {
+        let d = tempdir().unwrap();
+        let mut c = config(d.path());
+        c.output.max_markdown_bytes = 4096;
+        let mut s = Store::open(c).unwrap();
+        let stream = s.config.streams[0].clone();
+        // Five messages whose combined single-file size far exceeds 4 KiB but
+        // each block alone fits the budget. Grouping must break on boundaries.
+        let mut messages: Vec<Message> = (1..=5)
+            .map(|i| message(i, &large_text(1200), false, false))
+            .collect();
+        messages[2].reply_to = Some(1);
+        s.ingest(&stream, &messages, Utc::now()).unwrap();
+        assert_eq!(render(&s).unwrap(), 1);
+
+        let day_dir = d.path().join("out/one/2024");
+        let index = fs::read_to_string(day_dir.join("2024-01-01.md")).unwrap();
+        assert!(index.contains("schema: telegram-collector/markdown/v2"));
+        assert!(index.contains("parts: "));
+        assert!(index.contains("![[2024-01-01.part-0001]]"));
+
+        let mut part_files = fs::read_dir(&day_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("2024-01-01.part-") && n.ends_with(".md"))
+            .collect::<Vec<_>>();
+        part_files.sort();
+        assert!(
+            part_files.len() >= 2,
+            "expected multiple parts, got {part_files:?}"
+        );
+        for name in &part_files {
+            let bytes = fs::read(day_dir.join(name)).unwrap();
+            assert!(
+                bytes.len() <= 4096,
+                "{name} is {} bytes, exceeding the 4096 limit",
+                bytes.len()
+            );
+            let body = String::from_utf8(bytes).unwrap();
+            assert!(body.contains("type: telegram-chat-part"));
+            assert!(body.contains("schema: telegram-collector/markdown/v2"));
+        }
+        // The reply from message 3 to message 1 must resolve to the part that
+        // actually contains message 1, never the conservative placeholder.
+        let replyer_part = part_files
+            .iter()
+            .find(|name| {
+                fs::read_to_string(day_dir.join(name))
+                    .unwrap()
+                    .contains("^telegram-1-3")
+            })
+            .unwrap();
+        let replyer_body = fs::read_to_string(day_dir.join(replyer_part)).unwrap();
+        assert!(
+            replyer_body.contains("#^telegram-1-1")
+                || replyer_body.contains("2024-01-01.part-0001.md#^telegram-1-1"),
+            "cross-part reply link missing in {replyer_part}: {replyer_body}",
+        );
+    }
+
+    #[test]
+    fn partitioning_is_deterministic_and_idempotent() {
+        let d = tempdir().unwrap();
+        let mut c = config(d.path());
+        c.output.max_markdown_bytes = 4096;
+        let mut s = Store::open(c).unwrap();
+        let stream = s.config.streams[0].clone();
+        s.ingest(
+            &stream,
+            &(1..=6)
+                .map(|i| message(i, &large_text(1100), false, false))
+                .collect::<Vec<_>>(),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(render(&s).unwrap(), 1);
+        let day_dir = d.path().join("out/one/2024");
+        let snapshot: Vec<(String, Vec<u8>)> = {
+            let mut entries = fs::read_dir(&day_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let p = e.unwrap().path();
+                    let name = p.file_name()?.to_string_lossy().into_owned();
+                    if name.ends_with(".md") {
+                        Some((name, fs::read(&p).unwrap()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries
+        };
+        // Second render is a no-op for content, so it reports zero changes and
+        // preserves every file byte-for-byte.
+        assert_eq!(render(&s).unwrap(), 0);
+        let after: Vec<(String, Vec<u8>)> = {
+            let mut entries = fs::read_dir(&day_dir)
+                .unwrap()
+                .filter_map(|e| {
+                    let p = e.unwrap().path();
+                    let name = p.file_name()?.to_string_lossy().into_owned();
+                    if name.ends_with(".md") {
+                        Some((name, fs::read(&p).unwrap()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries
+        };
+        assert_eq!(snapshot, after);
+    }
+
+    #[test]
+    fn stale_parts_are_removed_when_message_count_shrinks() {
+        let d = tempdir().unwrap();
+        let mut c = config(d.path());
+        c.output.max_markdown_bytes = 4096;
+        let mut s = Store::open(c).unwrap();
+        let stream = s.config.streams[0].clone();
+        s.ingest(
+            &stream,
+            &(1..=8)
+                .map(|i| message(i, &large_text(1100), false, false))
+                .collect::<Vec<_>>(),
+            Utc::now(),
+        )
+        .unwrap();
+        render(&s).unwrap();
+        let day_dir = d.path().join("out/one/2024");
+        let parts_before = fs::read_dir(&day_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("2024-01-01.part-")
+            })
+            .count();
+        assert!(parts_before >= 2);
+
+        // Remove the last message by re-ingesting a tombstone; re-render should
+        // drop the now-surplus part files.
+        let mut shrunk: Vec<Message> = (1..=7)
+            .map(|i| {
+                if i == 8 {
+                    message(8, "", false, true)
+                } else {
+                    message(i, &large_text(1100), false, false)
+                }
+            })
+            .collect();
+        shrunk[6] = message(7, &large_text(1100), false, false);
+        let mut tombstoned = message(8, "", false, true);
+        tombstoned.date = Utc.with_ymd_and_hms(2024, 1, 1, 13, 0, 0).unwrap();
+        shrunk.push(tombstoned);
+        s.ingest(&stream, &shrunk, Utc::now()).unwrap();
+        render(&s).unwrap();
+        let parts_after = fs::read_dir(&day_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("2024-01-01.part-")
+            })
+            .count();
+        assert!(
+            parts_after <= parts_before,
+            "stale parts were not removed: {parts_before} -> {parts_after}"
+        );
+    }
+
+    #[test]
+    fn single_oversized_message_fails_rather_than_emitting_unreadable_part() {
+        let d = tempdir().unwrap();
+        let mut c = config(d.path());
+        c.output.max_markdown_bytes = 4096;
+        let mut s = Store::open(c).unwrap();
+        let stream = s.config.streams[0].clone();
+        s.ingest(
+            &stream,
+            &[message(1, &large_text(8192), false, false)],
+            Utc::now(),
+        )
+        .unwrap();
+        let err = render(&s).unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds max_markdown_bytes"),
+            "expected oversize-message error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cross_day_reply_targets_correct_part_in_partitioned_target_day() {
+        let d = tempdir().unwrap();
+        let mut c = config(d.path());
+        c.output.max_markdown_bytes = 4096;
+        let mut s = Store::open(c).unwrap();
+        let stream = s.config.streams[0].clone();
+        // Day 1 is oversized and partitions; day 2 replies to a message in
+        // day 1. The reply link must land on the specific part in day 1.
+        let day1: Vec<Message> = (1..=4)
+            .map(|i| message(i, &large_text(1100), false, false))
+            .collect();
+        s.ingest(&stream, &day1, Utc::now()).unwrap();
+        let mut reply = message(5, "reply back", false, false);
+        reply.date = Utc.with_ymd_and_hms(2024, 1, 2, 12, 0, 0).unwrap();
+        reply.reply_to = Some(1);
+        s.ingest(&stream, &[reply.clone()], Utc::now()).unwrap();
+        render(&s).unwrap();
+
+        let day2_dir = d.path().join("out/one/2024");
+        let day2 = fs::read_to_string(day2_dir.join("2024-01-02.md")).unwrap();
+        assert!(
+            day2.contains("../2024/2024-01-01.part-0001.md#^telegram-1-1"),
+            "cross-day reply should target the partitioned part, got: {day2}"
+        );
+    }
+
+    #[test]
+    fn max_markdown_bytes_below_minimum_is_rejected() {
+        let d = tempdir().unwrap();
+        let mut c = config(d.path());
+        c.output.max_markdown_bytes = 1024;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn many_parts_with_two_digit_count_each_remain_under_the_limit() {
+        let d = tempdir().unwrap();
+        let mut c = config(d.path());
+        c.output.max_markdown_bytes = 4096;
+        let mut s = Store::open(c).unwrap();
+        let stream = s.config.streams[0].clone();
+        // Each block is large enough that exactly one fits the (margin-reduced)
+        // sizing budget, producing ten or more two-digit parts. Final parts
+        // carry `parts: N` / `Part N of N` headers wider than the sizing
+        // headers, so this guards that header-width drift never pushes a part
+        // over the configured read limit.
+        s.ingest(
+            &stream,
+            &(1..=14)
+                .map(|i| message(i, &large_text(1700), false, false))
+                .collect::<Vec<_>>(),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(render(&s).unwrap(), 1);
+        let day_dir = d.path().join("out/one/2024");
+        let part_files: Vec<String> = fs::read_dir(&day_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("2024-01-01.part-") && n.ends_with(".md"))
+            .collect();
+        assert!(
+            part_files.len() >= 10,
+            "expected >= 10 two-digit parts, got {part_files:?}"
+        );
+        for name in &part_files {
+            let bytes = fs::read(day_dir.join(name)).unwrap();
+            assert!(
+                bytes.len() <= 4096,
+                "{name} is {} bytes, exceeding the 4096 limit",
+                bytes.len()
+            );
+        }
+        // The index must report the real two-digit parts count.
+        let index = fs::read_to_string(day_dir.join("2024-01-01.md")).unwrap();
+        assert!(index.contains(&format!("parts: {}", part_files.len())));
     }
 }

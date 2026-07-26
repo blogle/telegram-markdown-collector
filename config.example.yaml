@@ -13,6 +13,12 @@ state:
 output:
   root: ./output
   attachment_root: ./var/attachments
+  # Daily notes larger than this byte budget are split into retrieval-sized
+  # `.part-NNNN.md` files behind a small `YYYY-MM-DD.md` index. Defaults to
+  # 49152 (48 KiB) to stay within Markdown-vault single-read ceilings; minimum
+  # 4096. A single message whose own block exceeds the budget fails the render
+  # rather than producing an unreadable part.
+  max_markdown_bytes: 49152
 health:
   listen: 0.0.0.0:8080
 streams:
